@@ -26,7 +26,7 @@ def run_diarization(
     rttm_lines: List[str] = []
 
     # iterate diarization results
-    for segment, speaker in diarization.speaker_diarization:
+    for segment, _, speaker in diarization.itertracks(yield_label=True):
         start = float(segment.start)
         end = float(segment.end)
         if end - start < min_turn:

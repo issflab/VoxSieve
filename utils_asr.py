@@ -7,7 +7,7 @@ def run_asr(
     device: str = "cuda",
     compute_type: str = "float16",
     language: Optional[str] = None,
-    chunksize: int = None,
+    chunksize: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Returns dict with:

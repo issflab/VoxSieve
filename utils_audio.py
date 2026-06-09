@@ -33,13 +33,6 @@ def download_youtube_audio(url: str, out_path: Path):
             raise FileNotFoundError(f"Download did not create {out_path}")
 
 
-def _run(cmd):
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if p.returncode != 0:
-        raise RuntimeError(f"Command failed:\n{' '.join(cmd)}\n\nSTDERR:\n{p.stderr}")
-    return p
-
-
 def standardize_wav(in_path: Path, out_wav: Path, sr: int = 16000, normalize: bool = False):
     """
     Convert input audio to mono WAV at `sr`.

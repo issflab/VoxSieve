@@ -23,8 +23,9 @@ How to use:
 import argparse
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import pandas as pd
 
@@ -46,6 +47,38 @@ load_dotenv()
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
 
+
+# ── Output path containers ────────────────────────────────────────────────────
+
+@dataclass
+class BatchPaths:
+    """Shared output paths when processing a local video directory as a batch."""
+    root: Path
+    segments_dir: Path
+    target_segments_dir: Path
+    meta_jsonl: Path
+    meta_csv: Path
+    target_meta_jsonl: Path
+    target_meta_csv: Path
+
+
+@dataclass
+class ItemPaths:
+    """Resolved output paths for a single input item."""
+    vid_dir: Path
+    seg_dir: Path
+    target_seg_dir: Path
+    meta_jsonl: Path
+    meta_csv: Path
+    target_meta_jsonl: Path
+    target_meta_csv: Path
+    wav_path: Path
+    raw_audio: Path
+    segment_prefix: str
+    safe_id: str
+
+
+# ── Input parsing ─────────────────────────────────────────────────────────────
 
 def parse_time_to_seconds(x) -> float:
     if pd.isna(x):
@@ -72,7 +105,6 @@ def parse_time_to_seconds(x) -> float:
 def load_manifest(path: str) -> pd.DataFrame:
     p = Path(path)
 
-    # Single URL fallback
     if not p.exists():
         return pd.DataFrame([{
             "Speaker_Name": "unknown",
@@ -84,12 +116,10 @@ def load_manifest(path: str) -> pd.DataFrame:
 
     df = pd.read_csv(p)
 
-    required = {"Link"}
-    missing = required - set(df.columns)
+    missing = {"Link"} - set(df.columns)
     if missing:
         raise ValueError(f"Manifest missing required columns: {missing}")
 
-    # Normalize columns
     if "Start_time" in df.columns:
         df["Start_time_sec"] = df["Start_time"].apply(parse_time_to_seconds)
     else:
@@ -97,7 +127,6 @@ def load_manifest(path: str) -> pd.DataFrame:
 
     if "Processed" not in df.columns:
         df["Processed"] = "No"
-
     df["Processed"] = df["Processed"].fillna("No").astype(str).str.lower()
 
     if "Speaker_Name" not in df.columns:
@@ -107,29 +136,6 @@ def load_manifest(path: str) -> pd.DataFrame:
         df["Data_type"] = "unknown"
 
     return df
-
-
-def ensure_dir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
-
-
-def save_json(path: Path, obj: Any) -> None:
-    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False))
-
-
-def save_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
-    with path.open("w", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-
-def sanitize_source_id(value: str) -> str:
-    safe = value.replace("https://", "").replace("http://", "")
-    for ch in ("/", "\\", "?", "&", ":", "=", "#", " "):
-        safe = safe.replace(ch, "_")
-    while "__" in safe:
-        safe = safe.replace("__", "_")
-    return safe.strip("._") or "item"
 
 
 def load_url_file(path: Path) -> pd.DataFrame:
@@ -153,7 +159,6 @@ def scan_video_directory(path: Path) -> pd.DataFrame:
         p for p in path.rglob("*")
         if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
     )
-
     rows = []
     for video_path in matches:
         relative = video_path.relative_to(path)
@@ -167,7 +172,6 @@ def scan_video_directory(path: Path) -> pd.DataFrame:
             "Source_ID": sanitize_source_id(str(relative.with_suffix(""))),
             "Batch_ID": sanitize_source_id(path.resolve().name),
         })
-
     return pd.DataFrame(rows)
 
 
@@ -230,22 +234,29 @@ def build_input_items(input_value: str, input_mode: str = "auto") -> pd.DataFram
     return df
 
 
-def prepare_wav_for_item(
-    item: pd.Series,
-    raw_audio: Path,
-    wav_path: Path,
-    sr: int,
-    normalize: bool,
-) -> None:
-    source_type = item.get("Source_Type", "youtube")
-    source_ref = item["Link"]
+# ── Utilities ─────────────────────────────────────────────────────────────────
 
-    if source_type == "local_video":
-        standardize_wav(in_path=Path(source_ref), out_wav=wav_path, sr=sr, normalize=normalize)
-        return
+def sanitize_source_id(value: str) -> str:
+    safe = value.replace("https://", "").replace("http://", "")
+    for ch in ("/", "\\", "?", "&", ":", "=", "#", " "):
+        safe = safe.replace(ch, "_")
+    while "__" in safe:
+        safe = safe.replace("__", "_")
+    return safe.strip("._") or "item"
 
-    download_youtube_audio(url=source_ref, out_path=raw_audio)
-    standardize_wav(in_path=raw_audio, out_wav=wav_path, sr=sr, normalize=normalize)
+
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def save_json(path: Path, obj: Any) -> None:
+    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False))
+
+
+def save_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
 def append_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
@@ -272,6 +283,77 @@ def resolve_asr_runtime(device: str, compute_type: str) -> tuple[str, str]:
     return device, compute_type
 
 
+# ── Output path helpers ───────────────────────────────────────────────────────
+
+def setup_batch_paths(out_root: Path, batch_id: str) -> BatchPaths:
+    root = out_root / batch_id
+    return BatchPaths(
+        root=root,
+        segments_dir=root / "segments",
+        target_segments_dir=root / "segments_target_speaker",
+        meta_jsonl=root / "segments.jsonl",
+        meta_csv=root / "segments.csv",
+        target_meta_jsonl=root / "segments_target_speaker.jsonl",
+        target_meta_csv=root / "segments_target_speaker.csv",
+    )
+
+
+def build_item_paths(item: pd.Series, out_root: Path, batch: Optional[BatchPaths]) -> ItemPaths:
+    source_type = item.get("Source_Type", "youtube")
+    safe_id = item.get("Source_ID") or sanitize_source_id(item["Link"])
+
+    if source_type == "local_video" and batch is not None:
+        prefix = f"{safe_id}_"
+        return ItemPaths(
+            vid_dir=batch.root,
+            seg_dir=batch.segments_dir,
+            target_seg_dir=batch.target_segments_dir,
+            meta_jsonl=batch.meta_jsonl,
+            meta_csv=batch.meta_csv,
+            target_meta_jsonl=batch.target_meta_jsonl,
+            target_meta_csv=batch.target_meta_csv,
+            wav_path=batch.root / f"{prefix}audio_16k_mono.wav",
+            raw_audio=batch.root / f"{prefix}raw_audio.m4a",
+            segment_prefix=prefix,
+            safe_id=safe_id,
+        )
+
+    vid_dir = out_root / safe_id
+    return ItemPaths(
+        vid_dir=vid_dir,
+        seg_dir=vid_dir / "segments",
+        target_seg_dir=vid_dir / "segments_target_speaker",
+        meta_jsonl=vid_dir / "segments.jsonl",
+        meta_csv=vid_dir / "segments.csv",
+        target_meta_jsonl=vid_dir / "segments_target_speaker.jsonl",
+        target_meta_csv=vid_dir / "segments_target_speaker.csv",
+        wav_path=vid_dir / "audio_16k_mono.wav",
+        raw_audio=vid_dir / "raw_audio.m4a",
+        segment_prefix="",
+        safe_id=safe_id,
+    )
+
+
+# ── Audio helpers ─────────────────────────────────────────────────────────────
+
+def prepare_wav_for_item(
+    item: pd.Series,
+    raw_audio: Path,
+    wav_path: Path,
+    sr: int,
+    normalize: bool,
+) -> None:
+    source_type = item.get("Source_Type", "youtube")
+    source_ref = item["Link"]
+
+    if source_type == "local_video":
+        standardize_wav(in_path=Path(source_ref), out_wav=wav_path, sr=sr, normalize=normalize)
+        return
+
+    download_youtube_audio(url=source_ref, out_path=raw_audio)
+    standardize_wav(in_path=raw_audio, out_wav=wav_path, sr=sr, normalize=normalize)
+
+
 def cut_and_collect_segments(
     segments: List[Dict[str, Any]],
     wav_path: Path,
@@ -282,7 +364,7 @@ def cut_and_collect_segments(
     safe_id: str,
     segment_prefix: str = "",
     segment_id_prefix: str = "",
-    speaker_label: str | None = None,
+    speaker_label: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     meta_rows = []
     for i, seg in enumerate(segments):
@@ -315,6 +397,188 @@ def cut_and_collect_segments(
 
     return meta_rows
 
+
+# ── Per-item processing ───────────────────────────────────────────────────────
+
+def process_item(
+    item: pd.Series,
+    paths: ItemPaths,
+    args: argparse.Namespace,
+    asr_device: str,
+    asr_compute_type: str,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Run the full pipeline for one input item.
+    Returns (meta_rows, target_meta_rows).
+    """
+    source_ref = item["Link"]
+    source_type = item.get("Source_Type", "youtube")
+    speaker_name = item["Speaker_Name"]
+    start_time = float(item["Start_time_sec"])
+
+    # 1) Download / extract and standardize
+    prepare_wav_for_item(
+        item=item,
+        raw_audio=paths.raw_audio,
+        wav_path=paths.wav_path,
+        sr=args.sr,
+        normalize=args.normalize,
+    )
+
+    # 2) Diarization (optional)
+    if args.diarize:
+        hf_token = args.hf_token or os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+        if hf_token is None:
+            print("WARNING: No HF token provided. pyannote diarization likely requires it.")
+            print("Set --hf-token or env HF_TOKEN.")
+
+        diar = run_diarization(
+            wav_path=str(paths.wav_path),
+            hf_token=hf_token,
+            num_speakers=args.num_speakers,
+            min_turn=args.min_turn,
+        )
+        save_json(paths.vid_dir / f"{paths.segment_prefix}diarization.json", diar)
+        rttm_path = paths.vid_dir / f"{paths.segment_prefix}diarization.rttm"
+        rttm_path.write_text("\n".join(diar["rttm_lines"]) + "\n", encoding="utf-8")
+        diar_turns = diar["turns"]
+    else:
+        diar_turns = [{"start": 0.0, "end": float("inf"), "speaker": "SPK0"}]
+
+    target_speaker: Optional[str] = None
+    target_speaker_turns: List[Dict[str, Any]] = []
+
+    if args.diarize:
+        target_speaker = pick_speaker_by_window(
+            diar_turns, t=start_time, window=args.target_window,
+        )
+        if target_speaker is None:
+            print(
+                f"[warn] Could not identify target speaker near "
+                f"{start_time:.2f}s for source={source_ref}. "
+                "Skipping target-speaker-only outputs."
+            )
+        else:
+            target_speaker_turns = filter_turns_to_speaker(diar_turns, target_speaker)
+            save_json(paths.vid_dir / f"{paths.segment_prefix}target_speaker.json", {
+                "speaker_name": speaker_name,
+                "target_speaker_label": target_speaker,
+                "start_time_sec": start_time,
+                "window_sec": args.target_window,
+            })
+
+    if args.diarize and args.target_only:
+        if not target_speaker:
+            raise RuntimeError(
+                f"Could not identify target speaker near "
+                f"{start_time:.2f}s for source={source_ref}"
+            )
+        if not target_speaker_turns:
+            raise RuntimeError(
+                f"No diarization turns left after filtering "
+                f"(start_time={start_time:.2f}s, source={source_ref})"
+            )
+        diar_turns = target_speaker_turns
+
+    # 3) ASR
+    try:
+        asr = run_asr(
+            wav_path=str(paths.wav_path),
+            model=args.model,
+            device=asr_device,
+            compute_type=asr_compute_type,
+            language=args.language,
+        )
+    except Exception as exc:
+        if asr_device == "cuda" and "unsupported device" in str(exc).lower():
+            print("[warn] CUDA ASR is unavailable here. Retrying on CPU with int8.")
+            asr = run_asr(
+                wav_path=str(paths.wav_path),
+                model=args.model,
+                device="cpu",
+                compute_type="int8",
+                language=args.language,
+            )
+        else:
+            raise
+
+    assigned = assign_words_to_speakers(words=asr["words"], diar_turns=diar_turns)
+    target_assigned: List[Dict[str, Any]] = []
+    if args.diarize and target_speaker_turns:
+        target_assigned = assign_words_to_speakers(
+            words=asr["words"], diar_turns=target_speaker_turns,
+        )
+
+    # 4) Segmentation
+    duration = get_audio_duration_seconds(str(paths.wav_path))
+    if args.segment_mode == "fixed":
+        segments = build_fixed_window_segments(
+            audio_duration=duration,
+            window=args.window,
+            overlap=args.overlap,
+            min_last=args.min_last,
+        )
+    else:
+        segments = build_segments(
+            assigned_words=assigned,
+            gap_merge=args.gap_merge,
+            min_seg=args.min_seg,
+            max_seg=args.max_seg,
+        )
+
+    # 5) Cut all segments
+    meta_rows = cut_and_collect_segments(
+        segments=segments,
+        wav_path=paths.wav_path,
+        out_dir=paths.seg_dir,
+        sr=args.sr,
+        source_ref=source_ref,
+        source_type=source_type,
+        safe_id=paths.safe_id,
+        segment_prefix=paths.segment_prefix,
+    )
+
+    target_meta_rows: List[Dict[str, Any]] = []
+    if args.diarize and target_speaker_turns:
+        if args.no_asr:
+            target_segments = build_segments_from_diarization(
+                diar_turns=target_speaker_turns,
+                gap_merge=args.gap_merge,
+                min_seg=args.min_seg,
+                max_seg=args.max_seg,
+            )
+        else:
+            target_segments = build_segments(
+                assigned_words=target_assigned,
+                gap_merge=args.gap_merge,
+                min_seg=args.min_seg,
+                max_seg=args.max_seg,
+            )
+
+        target_meta_rows = cut_and_collect_segments(
+            segments=target_segments,
+            wav_path=paths.wav_path,
+            out_dir=paths.target_seg_dir,
+            sr=args.sr,
+            source_ref=source_ref,
+            source_type=source_type,
+            safe_id=paths.safe_id,
+            segment_prefix=paths.segment_prefix,
+            segment_id_prefix="target_",
+            speaker_label=target_speaker,
+        )
+
+    # 6) Cleanup intermediate files
+    if not args.keep_intermediate and source_type == "youtube":
+        try:
+            paths.raw_audio.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    return meta_rows, target_meta_rows
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
     usage_examples = """Examples:
@@ -370,7 +634,6 @@ def main():
     ap.add_argument("--save-asr", action="store_true", help="Run ASR and save outputs (independent of segmentation)")
     ap.add_argument("--overwrite", action="store_true", help="Reprocess items even if outputs already exist")
 
-    
     args = ap.parse_args()
 
     if args.target_only and not args.diarize:
@@ -386,44 +649,27 @@ def main():
     skipped_count = 0
     failed_items: List[str] = []
     aggregate_rows: List[Dict[str, Any]] = []
+    aggregate_target_rows: List[Dict[str, Any]] = []
 
     local_batch_mode = (
         not links_data.empty and
         links_data["Source_Type"].eq("local_video").all()
     )
-    local_batch_dir = None
-    local_batch_jsonl = None
-    local_batch_csv = None
-    local_batch_segments_dir = None
-    local_batch_target_jsonl = None
-    local_batch_target_csv = None
-    local_batch_target_segments_dir = None
-    aggregate_target_rows: List[Dict[str, Any]] = []
+    batch: Optional[BatchPaths] = None
 
     if local_batch_mode:
         batch_id = links_data.iloc[0].get("Batch_ID") or "local_videos"
-        local_batch_dir = out_root / batch_id
-        local_batch_jsonl = local_batch_dir / "segments.jsonl"
-        local_batch_csv = local_batch_dir / "segments.csv"
-        local_batch_segments_dir = local_batch_dir / "segments"
-        local_batch_target_jsonl = local_batch_dir / "segments_target_speaker.jsonl"
-        local_batch_target_csv = local_batch_dir / "segments_target_speaker.csv"
-        local_batch_target_segments_dir = local_batch_dir / "segments_target_speaker"
-        ensure_dir(local_batch_dir)
-        ensure_dir(local_batch_segments_dir)
-        ensure_dir(local_batch_target_segments_dir)
+        batch = setup_batch_paths(out_root, batch_id)
+        ensure_dir(batch.root)
+        ensure_dir(batch.segments_dir)
+        ensure_dir(batch.target_segments_dir)
 
         if args.overwrite:
-            if local_batch_jsonl.exists():
-                local_batch_jsonl.unlink()
-            if local_batch_csv.exists():
-                local_batch_csv.unlink()
-            if local_batch_target_jsonl.exists():
-                local_batch_target_jsonl.unlink()
-            if local_batch_target_csv.exists():
-                local_batch_target_csv.unlink()
-        elif local_batch_jsonl.exists() and local_batch_csv.exists():
-            print(f"[skip] Existing outputs found for directory batch {local_batch_dir}")
+            for p in (batch.meta_jsonl, batch.meta_csv, batch.target_meta_jsonl, batch.target_meta_csv):
+                if p.exists():
+                    p.unlink()
+        elif batch.meta_jsonl.exists() and batch.meta_csv.exists():
+            print(f"[skip] Existing outputs found for directory batch {batch.root}")
             print(f"Done. Output: {out_root.resolve()} | processed=0 skipped={len(links_data)} failed=0")
             return
 
@@ -434,256 +680,47 @@ def main():
 
         source_ref = row["Link"]
         source_type = row.get("Source_Type", "youtube")
-        speaker_name = row["Speaker_Name"]
-        split = row["Data_type"]
-        start_time = float(row["Start_time_sec"])
+        paths = build_item_paths(row, out_root, batch)
 
-        safe_id = row.get("Source_ID") or sanitize_source_id(source_ref)
-        vid_dir = out_root / safe_id
-        seg_dir = None
-        meta_jsonl_path = None
-        meta_csv_path = None
-        target_seg_dir = None
-        target_meta_jsonl_path = None
-        target_meta_csv_path = None
-        segment_prefix = ""
-
-        if source_type == "local_video" and local_batch_dir is not None:
-            vid_dir = local_batch_dir
-            seg_dir = local_batch_segments_dir
-            meta_jsonl_path = local_batch_jsonl
-            meta_csv_path = local_batch_csv
-            target_seg_dir = local_batch_target_segments_dir
-            target_meta_jsonl_path = local_batch_target_jsonl
-            target_meta_csv_path = local_batch_target_csv
-            segment_prefix = f"{safe_id}_"
-        else:
-            seg_dir = vid_dir / "segments"
-            meta_jsonl_path = vid_dir / "segments.jsonl"
-            meta_csv_path = vid_dir / "segments.csv"
-            target_seg_dir = vid_dir / "segments_targer_speaker"
-            target_meta_jsonl_path = vid_dir / "segments_targer_speaker.jsonl"
-            target_meta_csv_path = vid_dir / "segments_targer_speaker.csv"
-
-        ensure_dir(vid_dir)
-        ensure_dir(seg_dir)
+        ensure_dir(paths.vid_dir)
+        ensure_dir(paths.seg_dir)
         if args.diarize:
-            ensure_dir(target_seg_dir)
-
-        wav_basename = f"{segment_prefix}audio_16k_mono.wav"
-        raw_basename = f"{segment_prefix}raw_audio.m4a"
+            ensure_dir(paths.target_seg_dir)
 
         if (
             source_type != "local_video" and
-            not args.overwrite and meta_jsonl_path.exists() and meta_csv_path.exists()
+            not args.overwrite and
+            paths.meta_jsonl.exists() and paths.meta_csv.exists()
         ):
             print(f"[skip] Existing outputs found for {source_ref}")
             skipped_count += 1
             continue
 
-        raw_audio = vid_dir / raw_basename
-        wav_path = vid_dir / wav_basename
-
-        print(
-            f"[{idx + 1}/{len(links_data)}] Processing {source_type}: {source_ref}"
-        )
+        print(f"[{idx + 1}/{len(links_data)}] Processing {source_type}: {source_ref}")
 
         try:
-            # 1) Download/extract and standardize
-            prepare_wav_for_item(
-                item=row,
-                raw_audio=raw_audio,
-                wav_path=wav_path,
-                sr=args.sr,
-                normalize=args.normalize,
-            )
+            meta_rows, target_meta_rows = process_item(row, paths, args, asr_device, asr_compute_type)
 
-            # 2) Diarization (optional)
-            if args.diarize:
-                hf_token = args.hf_token or os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
-                if hf_token is None:
-                    print("WARNING: No HF token provided. pyannote diarization likely requires it.")
-                    print("Set --hf-token or env HF_TOKEN.")
-
-                diar_json_name = f"{segment_prefix}diarization.json"
-                diar_rttm_name = f"{segment_prefix}diarization.rttm"
-                diar_json_path = vid_dir / diar_json_name
-                diar_rttm_path = vid_dir / diar_rttm_name
-
-                diar = run_diarization(
-                    wav_path=str(wav_path),
-                    hf_token=hf_token,
-                    num_speakers=args.num_speakers,
-                    min_turn=args.min_turn,
-                )
-
-                save_json(diar_json_path, diar)
-                diar_rttm_path.write_text("\n".join(diar["rttm_lines"]) + "\n", encoding="utf-8")
-
-                diar_turns = diar["turns"]
-            else:
-                # Single-speaker fallback covering full audio
-                diar_turns = [{
-                    "start": 0.0,
-                    "end": float("inf"),
-                    "speaker": "SPK0"
-                }]
-
-            all_diar_turns = diar_turns
-            target_speaker = None
-            target_speaker_turns: List[Dict[str, Any]] = []
-            if args.diarize:
-                target_speaker = pick_speaker_by_window(
-                    all_diar_turns,
-                    t=start_time,
-                    window=args.target_window,
-                )
-
-                if target_speaker is None:
-                    print(
-                        f"[warn] Could not identify target speaker near "
-                        f"{start_time:.2f}s for source={source_ref}. "
-                        "Skipping target-speaker-only outputs."
-                    )
-                else:
-                    target_speaker_turns = filter_turns_to_speaker(all_diar_turns, target_speaker)
-                    save_json(vid_dir / f"{segment_prefix}target_speaker.json", {
-                        "speaker_name": speaker_name,
-                        "target_speaker_label": target_speaker,
-                        "start_time_sec": start_time,
-                        "window_sec": args.target_window,
-                    })
-
-            if args.diarize and args.target_only:
-                if target_speaker is None:
-                    raise RuntimeError(
-                        f"Could not identify target speaker near "
-                        f"{start_time:.2f}s for source={source_ref}"
-                    )
-                diar_turns = target_speaker_turns
-
-            if args.diarize and args.target_only and not diar_turns:
-                raise RuntimeError(
-                    f"No diarization turns left after filtering "
-                    f"(start_time={start_time:.2f}s, source={source_ref})"
-                )
-
-            # 3) ASR
-            try:
-                asr = run_asr(
-                    wav_path=str(wav_path),
-                    model=args.model,
-                    device=asr_device,
-                    compute_type=asr_compute_type,
-                    language=args.language
-                )
-            except Exception as exc:
-                if asr_device == "cuda" and "unsupported device" in str(exc).lower():
-                    print("[warn] CUDA ASR is unavailable here. Retrying on CPU with int8.")
-                    asr = run_asr(
-                        wav_path=str(wav_path),
-                        model=args.model,
-                        device="cpu",
-                        compute_type="int8",
-                        language=args.language
-                    )
-                else:
-                    raise
-
-            assigned = assign_words_to_speakers(
-                words=asr["words"],
-                diar_turns=diar_turns,
-            )
-            target_assigned = []
-            if args.diarize and target_speaker_turns:
-                target_assigned = assign_words_to_speakers(
-                    words=asr["words"],
-                    diar_turns=target_speaker_turns,
-                )
-
-            # segmentation
-            duration = get_audio_duration_seconds(str(wav_path))
-            if args.segment_mode == "fixed":
-                segments = build_fixed_window_segments(
-                    audio_duration=duration,
-                    window=args.window,
-                    overlap=args.overlap,
-                    min_last=args.min_last
-                )
-            else:
-                segments = build_segments(
-                    assigned_words=assigned,
-                    gap_merge=args.gap_merge,
-                    min_seg=args.min_seg,
-                    max_seg=args.max_seg,
-                )
-
-            meta_rows = cut_and_collect_segments(
-                segments=segments,
-                wav_path=wav_path,
-                out_dir=seg_dir,
-                sr=args.sr,
-                source_ref=source_ref,
-                source_type=source_type,
-                safe_id=safe_id,
-                segment_prefix=segment_prefix,
-            )
-
-            target_meta_rows: List[Dict[str, Any]] = []
-            if args.diarize and target_speaker_turns:
-                if args.no_asr:
-                    target_segments = build_segments_from_diarization(
-                        diar_turns=target_speaker_turns,
-                        gap_merge=args.gap_merge,
-                        min_seg=args.min_seg,
-                        max_seg=args.max_seg,
-                    )
-                else:
-                    target_segments = build_segments(
-                        assigned_words=target_assigned,
-                        gap_merge=args.gap_merge,
-                        min_seg=args.min_seg,
-                        max_seg=args.max_seg,
-                    )
-
-                target_meta_rows = cut_and_collect_segments(
-                    segments=target_segments,
-                    wav_path=wav_path,
-                    out_dir=target_seg_dir,
-                    sr=args.sr,
-                    source_ref=source_ref,
-                    source_type=source_type,
-                    safe_id=safe_id,
-                    segment_prefix=segment_prefix,
-                    segment_id_prefix="target_",
-                    speaker_label=target_speaker,
-                )
-
-            if source_type == "local_video" and local_batch_dir is not None:
-                append_jsonl(meta_jsonl_path, meta_rows)
+            if local_batch_mode:
+                append_jsonl(paths.meta_jsonl, meta_rows)
                 aggregate_rows.extend(meta_rows)
-                pd.DataFrame(aggregate_rows).to_csv(meta_csv_path, index=False)
+                pd.DataFrame(aggregate_rows).to_csv(paths.meta_csv, index=False)
                 if target_meta_rows:
-                    append_jsonl(target_meta_jsonl_path, target_meta_rows)
+                    append_jsonl(paths.target_meta_jsonl, target_meta_rows)
                     aggregate_target_rows.extend(target_meta_rows)
-                    pd.DataFrame(aggregate_target_rows).to_csv(target_meta_csv_path, index=False)
+                    pd.DataFrame(aggregate_target_rows).to_csv(paths.target_meta_csv, index=False)
             else:
-                save_jsonl(meta_jsonl_path, meta_rows)
-                pd.DataFrame(meta_rows).to_csv(meta_csv_path, index=False)
+                save_jsonl(paths.meta_jsonl, meta_rows)
+                pd.DataFrame(meta_rows).to_csv(paths.meta_csv, index=False)
                 if target_meta_rows:
-                    save_jsonl(target_meta_jsonl_path, target_meta_rows)
-                    pd.DataFrame(target_meta_rows).to_csv(target_meta_csv_path, index=False)
-
-            if not args.keep_intermediate and source_type == "youtube":
-                try:
-                    raw_audio.unlink(missing_ok=True)
-                except Exception:
-                    pass
+                    save_jsonl(paths.target_meta_jsonl, target_meta_rows)
+                    pd.DataFrame(target_meta_rows).to_csv(paths.target_meta_csv, index=False)
 
             processed_count += 1
-            print(f"[done] Wrote {len(meta_rows)} segments to {seg_dir}")
+            print(f"[done] Wrote {len(meta_rows)} segments to {paths.seg_dir}")
             if target_meta_rows:
-                print(f"[done] Wrote {len(target_meta_rows)} target-speaker segments to {target_seg_dir}")
+                print(f"[done] Wrote {len(target_meta_rows)} target-speaker segments to {paths.target_seg_dir}")
+
         except Exception as exc:
             failed_items.append(source_ref)
             print(f"[error] Failed to process {source_ref}: {exc}")
